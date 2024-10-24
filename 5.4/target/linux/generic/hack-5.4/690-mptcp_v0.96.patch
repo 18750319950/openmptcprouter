@@ -23529,14 +23529,62 @@ index 000000000000..396e8aaf4762
 +
 +#include <linux/module.h>
 +#include <net/mptcp.h>
++#include <linux/random.h>
 +
-+static unsigned char num_segments __read_mostly = 1;
++#include <linux/sysctl.h>
++
++
++#define INET_ADDRSTRLEN 16		
++//#define TRY_DELETE_AND_DISCONNECT 100
++//#define FORCE_RECONNECT 300
++
++
++static unsigned int TRY_DELETE_AND_DISCONNECT = 100;
++module_param(TRY_DELETE_AND_DISCONNECT, int, S_IRUSR|S_IWUSR);
++
++static unsigned int FORCE_RECONNECT = 300;
++module_param(FORCE_RECONNECT, int, S_IRUSR|S_IWUSR);
++
++static char* ip = "192.168.110.14";
++module_param(ip, charp, S_IRUSR|S_IWUSR);
++
++
++
++
++
++static unsigned char mainRoadRate = 80;
++module_param(mainRoadRate, byte, S_IRUSR|S_IWUSR);
++
++
++static unsigned char num_segments __read_mostly = 2;
 +module_param(num_segments, byte, 0644);
 +MODULE_PARM_DESC(num_segments, "The number of consecutive segments that are part of a burst");
 +
 +static bool cwnd_limited __read_mostly = 1;
 +module_param(cwnd_limited, bool, 0644);
 +MODULE_PARM_DESC(cwnd_limited, "if set to 1, the scheduler tries to fill the congestion-window on all subflows");
++
++
++
++// int notify_param(const char *val, const struct kernel_param *kp)
++//  {
++//    int res = param_set_int(val, kp);
++//     return 0;
++//  }
++
++//  const struct kernel_param_ops my_param_ops =
++//  {
++//   .set = &notify_param,
++//   .get = &param_get_int,
++//  };
++//  module_param_cb(mainRoadRate, &my_param_ops, &mainRoadRate, S_IRUGO|S_IWUSR );
++
++
++
++
++
++
++
 +
 +struct rrsched_priv {
 +	unsigned char quota;
@@ -23622,6 +23670,59 @@ index 000000000000..396e8aaf4762
 +		/* Has the skb already been enqueued into this subsocket? */
 +		mptcp_pi_to_flag(tp->mptcp->path_index) & TCP_SKB_CB(skb)->path_mask;
 +}
++/* Author:GTJ 2024/4/3 */
++#define MAX_SUBFLOW_RECOED 30
++typedef struct mySubflowTag{
++	int appearCount;
++	int disappearCount;
++	int pathIndex;
++}mySubflowTag;
++
++mySubflowTag SubFlows[MAX_SUBFLOW_RECOED];
++#define CALL_ONCE(func)                                                        
++	do {                                                                   
++		static bool called = false;                                    
++		if (!called) {                                                 
++			called = true;                                         
++			func;                                                  
++		}                                                              
++	} while (0)
++
++void init_record(void){
++	int index = 0;
++	for(;index < MAX_SUBFLOW_RECOED; ++index){
++		SubFlows[index].pathIndex = -1;
++		SubFlows[index].appearCount = 0;
++		SubFlows[index].disappearCount = 0;
++	}
++}
++
++void delete_record(struct mptcp_cb* mpcb){
++	struct mptcp_tcp_sock* mptcp;
++	int index = 0;
++	for(;index < MAX_SUBFLOW_RECOED; ++index){
++		int pathIndex = SubFlows[index].pathIndex;
++		int findFlag = 0;
++		if(pathIndex == -1){
++			continue;
++		}
++		mptcp_for_each_sub(mpcb, mptcp) {
++			struct sock *sk = mptcp_to_sock(mptcp);
++			struct tcp_sock *tp = tcp_sk(sk);
++			int mainPathIndex = tp->mptcp->path_index;
++			if(pathIndex == mainPathIndex){
++				findFlag = 1;
++				break;
++			}
++		}
++		if(!findFlag){
++			SubFlows[index].pathIndex = -1;
++			SubFlows[index].appearCount = 0;
++			SubFlows[index].disappearCount = 0;
++		}
++	}
++}
++/*End GTJ */
 +
 +/* We just look for any subflow that is available */
 +static struct sock *rr_get_available_subflow(struct sock *meta_sk,
@@ -23714,7 +23815,6 @@ index 000000000000..396e8aaf4762
 +	struct sk_buff *skb = __mptcp_rr_next_segment(meta_sk, reinject);
 +	unsigned char split = num_segments;
 +	unsigned char iter = 0, full_subs = 0;
-+
 +	/* As we set it, we have to reset it as well. */
 +	*limit = 0;
 +
@@ -23729,13 +23829,116 @@ index 000000000000..396e8aaf4762
 +		return skb;
 +	}
 +
-+retry:
++	//printk("mainRoadRate %d\n",mainRoadRate);
++	char read_ip[INET_ADDRSTRLEN];
++	static int  forceReconnect = 0;
++	/* Author:GTJ 2024/4/3 */
++	int currentPathNums = 0;
++	//record message
 +
++	forceReconnect = forceReconnect + 1;
++	if(FORCE_RECONNECT < forceReconnect){
++		forceReconnect = 0;
++		if(mpcb->pm_ops->new_remote_address){
++			mpcb->pm_ops->new_remote_address(mpcb->meta_sk);
++		}
++	}
++	CALL_ONCE(init_record());
++
++
++	mptcp_for_each_sub(mpcb, mptcp) {
++		/*< 统计当前子流数量 */
++		currentPathNums = currentPathNums + 1;
++	}
++	if( 1 < currentPathNums){
++		/*< 子流数据只有1条时不做任何处理 */
++		mptcp_for_each_sub(mpcb, mptcp) {
++			struct sock *sk = mptcp_to_sock(mptcp);
++			struct tcp_sock *tp = tcp_sk(sk);
++			int pathIndex = tp->mptcp->path_index;
++			int index = 0;
++			bool findFlag = false; 
++			for(index = 0; index < MAX_SUBFLOW_RECOED; ++index){
++				/*< 检索当前自定义路径记录中是否有该条子流*/
++				if(SubFlows[index].pathIndex == pathIndex){
++					findFlag = true;
++					if (mptcp_is_def_unavailable(sk)){
++						/*< 子流存在检测可用性，此处为不可用时调用 */
++						SubFlows[index].disappearCount = SubFlows[index].disappearCount + 1;
++						SubFlows[index].appearCount = 0;
++						break;
++					}
++					/*< 此处认定路径可用，清除计数*/
++					SubFlows[index].appearCount = SubFlows[index].appearCount + 1;
++					SubFlows[index].disappearCount = 0;
++					break;
++				}
++			}
++			if(!findFlag){
++				/*< 子流未存在自定义路径管理中，寻找可用位置插入信息 */
++				for(index = 0; index < MAX_SUBFLOW_RECOED; ++index){
++					if(SubFlows[index].pathIndex == -1){
++						SubFlows[index].pathIndex = pathIndex;
++						break;
++					}
++				}
++			}
++		}
++
++		mptcp_for_each_sub(mpcb, mptcp) {
++			struct sock *sk = mptcp_to_sock(mptcp);
++			struct tcp_sock *tp = tcp_sk(sk);
++			int pathIndex = tp->mptcp->path_index;
++			int index = 0;
++			for(index = 0; index < MAX_SUBFLOW_RECOED; ++index){
++				/*< 对于判定认为应该删除的子流进行删除 */
++				if(SubFlows[index].pathIndex == pathIndex){
++					if(TRY_DELETE_AND_DISCONNECT < SubFlows[index].disappearCount){
++						mptcp_sub_force_close(sk);
++						SubFlows[index].pathIndex = -1;
++						SubFlows[index].disappearCount = 0;
++						SubFlows[index].appearCount = 0;
++					}
++				}
++			}
++		}
++		/*< 更新路径管理信息 */
++		delete_record(mpcb);
++
++		unsigned int chosen_path;
++		get_random_bytes(&chosen_path, sizeof(chosen_path));
++		chosen_path = do_div(chosen_path,100); // 将随机数限制在0到99之间
++		if (chosen_path < mainRoadRate) {
++			mptcp_for_each_sub(mpcb, mptcp) {
++				struct sock *sk_it = mptcp_to_sock(mptcp);
++				struct tcp_sock *tp_it = tcp_sk(sk_it);
++				struct rrsched_priv *rr_p = rrsched_get_priv(tp_it);
++				if (!mptcp_rr_is_available(sk_it, skb, false, cwnd_limited)){
++					continue;
++				}
++				snprintf(read_ip, INET_ADDRSTRLEN, "%pI4", (void*)&tp_it->inet_conn.icsk_inet.inet_saddr);
++				if (strcmp(ip, read_ip) == 0) {
++					choose_sk = sk_it;
++					goto found;
++				}
++			}
++		}
++
++	}
++
++
++
++retry:
 +	/* First, we look for a subflow who is currently being used */
 +	mptcp_for_each_sub(mpcb, mptcp) {
 +		struct sock *sk_it = mptcp_to_sock(mptcp);
 +		struct tcp_sock *tp_it = tcp_sk(sk_it);
 +		struct rrsched_priv *rr_p = rrsched_get_priv(tp_it);
++
++		snprintf(read_ip, INET_ADDRSTRLEN, "%pI4", (void*)&tp_it->inet_conn.icsk_inet.inet_saddr);
++		if (1 < currentPathNums && strcmp(ip, read_ip) == 0) {
++			continue;
++		}
 +
 +		if (!mptcp_rr_is_available(sk_it, skb, false, cwnd_limited))
 +			continue;
@@ -23780,6 +23983,7 @@ index 000000000000..396e8aaf4762
 +
 +		goto retry;
 +	}
++
 +
 +found:
 +	if (choose_sk) {
