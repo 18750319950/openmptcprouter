@@ -23691,7 +23691,7 @@ index 000000000000..396e8aaf4762
 +void init_record(void){
 +	int index = 0;
 +	for(;index < MAX_SUBFLOW_RECOED; ++index){
-+		SubFlows[index].pathIndex = -1;
++		SubFlows[index].pathIndex = -1;printf("Hello world");
 +		SubFlows[index].appearCount = 0;
 +		SubFlows[index].disappearCount = 0;
 +	}
